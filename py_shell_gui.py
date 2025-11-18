@@ -1,11 +1,42 @@
+#!/usr/bin/env python3
+"""
+Clean, ready-to-run py_shell_gui.py for AuraShell (GUI) with pipeline support.
+
+Features:
+ - Proper quoted-argument parsing using shlex.split()
+ - Multi-stage pipeline support using subprocess.Popen
+ - Support for builtin commands producing output into pipelines (dir, echo, pwd, history)
+ - Safe argv-based execution for normal commands
+ - Fallback to shell=True when shell operators (>, <, &&, ;, ||) are present
+ - Preserves builtins: exit, echo, type, cd, pwd, history, cls, help, dir
+ - GUI with autocompletion, history, and typo-suggestion flow retained
+
+Usage:
+    python py_shell_gui.py
+
+Drop this file into your project folder and run it. No sandbox or /mnt/data
+references are included.
+"""
+
 import tkinter as tk
 from tkinter import scrolledtext
 import subprocess
 import os
 import sys
 from rapidfuzz import distance as rapidfuzz_distance
+import shlex
+import shutil
+import threading
+from typing import List, Callable, Optional
+import io
 
 HISTORY_FILE = os.path.expanduser("~/.aurashell_history")
+
+# Simple in-memory history used by process_command wrapper below
+HISTORY: List[str] = []
+
+# We'll populate builtins inside the PyShell __init__ so they can call module-level
+# helpers (which are defined below) for pipeline-capable behavior.
 
 class PyShell(tk.Tk):
     def __init__(self):
@@ -16,15 +47,18 @@ class PyShell(tk.Tk):
         self.command_history = []
         self.history_index = 0
         self.load_history()
+        # builtins mapping: each value is a callable taking (args, out=None)
+        # When called with just (args) it will still work because out has default None.
         self.builtins = {
-            "exit": self.handle_exit,
-            "echo": self.handle_echo,
-            "type": self.handle_type,
-            "cd": self.handle_cd,
-            "pwd": self.handle_pwd,
-            "history": self.handle_history,
-            "cls": self.handle_clear,
-            "help": self.handle_help,
+            "exit": lambda args, out=None: self.handle_exit(args),
+            "echo": lambda args, out=None: handle_echo(self, args, out),
+            "type": lambda args, out=None: self.handle_type(args) if out is None else self._type_to_out(args, out),
+            "cd": lambda args, out=None: self.handle_cd(args),
+            "pwd": lambda args, out=None: handle_pwd(self, args, out),
+            "history": lambda args, out=None: handle_history(self, args, out),
+            "cls": lambda args, out=None: self.handle_clear(args),
+            "help": lambda args, out=None: self.handle_help(args),
+            "dir": lambda args, out=None: handle_dir(self, args, out),
         }
         self.all_system_commands = self.get_path_commands()
         self.correction_active = False
@@ -99,34 +133,145 @@ class PyShell(tk.Tk):
         if not command_line:
             self.update_prompt()
             return
+
+        # record history
         if command_line:
             self.command_history.append(command_line)
         self.history_index = len(self.command_history)
+
+        # correction flow
         if self.correction_active:
             self.handle_correction_response(command_line)
             return
-        parts = command_line.split()
+
+        # If the user typed a pipeline, prefer pipeline execution.
+        if '|' in command_line:
+            # tokenise safely to inspect stage commands
+            try:
+                tokens = shlex.split(command_line, posix=True)
+            except ValueError as e:
+                self.print_to_output(f"Parsing error: {e}\n")
+                return
+
+            # extract the first token of each stage (commands before each |)
+            stage_cmds = []
+            cur = []
+            for tok in tokens:
+                if tok == '|':
+                    if cur:
+                        stage_cmds.append(cur[0])
+                        cur = []
+                else:
+                    cur.append(tok)
+            if cur:
+                stage_cmds.append(cur[0])
+
+            # If any stage is a builtin, run the pipeline with mixed builtin/external support
+            if any((cmd in self.builtins) for cmd in stage_cmds):
+                try:
+                    stages = split_pipeline_stages(command_line)
+                except ValueError as e:
+                    self.print_to_output(f"Parsing error: {e}\n")
+                    self.update_prompt()
+                    return
+                try:
+                    rc, out, err = execute_mixed_pipeline(stages, self, cwd=self.current_cwd)
+                    if out:
+                        self.print_to_output(out)
+                    if err:
+                        self.print_to_output(err)
+                    if rc == 127 and stage_cmds:
+                        self.suggest_correction(stage_cmds[0], [])
+                except Exception as e:
+                    self.print_to_output(f"Error executing mixed pipeline: {e}\n")
+                self.update_prompt()
+                return
+            else:
+                # No builtins involved — use the safer native pipeline executor
+                try:
+                    rc, out, err = process_command_external(command_line, cwd=self.current_cwd)
+                    if out:
+                        self.print_to_output(out)
+                    if err:
+                        self.print_to_output(err)
+                    if rc == 127 and stage_cmds:
+                        self.suggest_correction(stage_cmds[0], [])
+                except Exception as e:
+                    self.print_to_output(f"Error executing pipeline: {e}\n")
+                self.update_prompt()
+                return
+
+        # --- Non-pipeline path: preserve builtin dispatch and external execution ---
+        # Use shlex to split for correct handling of quotes when dispatching to builtins
+        if is_shell_operator_present(command_line):
+            try:
+                rc, out, err = process_command_external(command_line, cwd=self.current_cwd)
+                if out:
+                    self.print_to_output(out)
+                if err:
+                    self.print_to_output(err)
+            except Exception as e:
+                self.print_to_output(f"Error executing shell command: {e}\n")
+            self.update_prompt()
+            return
+        try:
+            parts = shlex.split(command_line, posix=True)
+        except ValueError as e:
+            self.print_to_output(f"Parsing error: {e}\n")
+            return
+        if not parts:
+            self.update_prompt()
+            return
         command = parts[0]
         args = parts[1:]
+
         if command in self.builtins:
+            # builtin handlers (cd, echo, etc.)
+            # builtins in this mapping accept (args, out=None)
             self.builtins[command](args)
         else:
-            self.execute_external(command, args)
+            # Use the wrapper that calls the improved external executor
+            try:
+                # Requote args to reconstruct a safe command line for the external executor
+                quoted_args = " ".join(shlex.quote(a) for a in args)
+                command_line_for_exec = command if not quoted_args else f"{command} {quoted_args}"
+                rc, out, err = process_command_external(command_line_for_exec, cwd=self.current_cwd)
+                if out:
+                    self.print_to_output(out)
+                if err:
+                    self.print_to_output(err)
+                if rc == 127:
+                    # preserve suggestion behavior on not-found
+                    self.suggest_correction(command, args)
+            except Exception as e:
+                self.print_to_output(f"Error executing external command: {e}\n")
+
         self.update_prompt()
 
+
     def on_exit(self):
-        self.print_to_output("Saving history... Exiting AuraShell...\n")
+        self.print_to_output("Saving history. Exiting AuraShell.\n")
         self.save_history()
         self.destroy()
-
-    def handle_exit(self, args):
-        self.on_exit()
-
-    def handle_echo(self, args):
-        self.print_to_output(" ".join(args) + "\n")
-
-    def handle_pwd(self, args):
-        self.print_to_output(self.current_cwd + "\n")
+    
+    def _type_to_out(self, args, out):
+        # Small adapter so `type` builtin can write to a pipe when used in a pipeline
+        if not args:
+            out.write("type: missing operand\n")
+            out.flush()
+            return
+        cmd_to_find = args[0]
+        if cmd_to_find in self.builtins:
+            out.write(f"{cmd_to_find} is a shell builtin\n")
+            out.flush()
+            return
+        found_path = self.find_in_path(cmd_to_find)
+        if found_path:
+            out.write(f"{cmd_to_find} is {found_path}\n")
+            out.flush()
+            return
+        out.write(f"{cmd_to_find}: not found\n")
+        out.flush()
 
     def handle_clear(self, args):
         self.output_area.config(state='normal')
@@ -156,6 +301,7 @@ class PyShell(tk.Tk):
             self.print_to_output(f"cd error: {e}\n")
 
     def handle_type(self, args):
+        # non-pipeline behavior: prints to GUI
         if not args:
             self.print_to_output("type: missing operand\n")
             return
@@ -170,28 +316,17 @@ class PyShell(tk.Tk):
         self.print_to_output(f"{cmd_to_find}: not found\n")
 
     def execute_external(self, command, args):
+        # kept for compatibility; older UI paths call this. We reconstruct a line and use new executor
         try:
-            result = subprocess.run(
-                [command] + args,
-                capture_output=True, text=True,
-                cwd=self.current_cwd, shell=True
-            )
-            if result.returncode != 0:
-                stderr_lower = (result.stderr or "").lower()
-                if "not recognized" in stderr_lower or "not found" in stderr_lower or "no such file" in stderr_lower:
-                    self.suggest_correction(command, args)
-                else:
-                    if result.stdout:
-                        self.print_to_output(result.stdout)
-                    if result.stderr:
-                        self.print_to_output(result.stderr)
-            else:
-                if result.stdout:
-                    self.print_to_output(result.stdout)
-                if result.stderr:
-                    self.print_to_output(result.stderr)
-        except FileNotFoundError:
-            self.suggest_correction(command, args)
+            quoted_args = " ".join(shlex.quote(a) for a in args)
+            command_line_for_exec = command if not quoted_args else f"{command} {quoted_args}"
+            rc, out, err = process_command_external(command_line_for_exec, cwd=self.current_cwd)
+            if out:
+                self.print_to_output(out)
+            if err:
+                self.print_to_output(err)
+            if rc == 127:
+                self.suggest_correction(command, args)
         except Exception as e:
             self.print_to_output(f"Error: {e}\n")
 
@@ -502,6 +637,381 @@ class PyShell(tk.Tk):
             history_str += f"  {i+1}  {command}\n"
         self.print_to_output(history_str)
 
+
+# --- Improved external execution functions (pipeline + shell-aware) ---
+
+def is_shell_operator_present(s: str) -> bool:
+    ops = [">", "<", "&&", "&", ";", "||"]
+    return any(op in s for op in ops)
+
+
+def split_pipeline_stages(command_line: str) -> List[List[str]]:
+    tokens = shlex.split(command_line, posix=True)
+    stages: List[List[str]] = []
+    cur: List[str] = []
+    for tok in tokens:
+        if tok == "|":
+            if not cur:
+                raise ValueError("Empty stage in pipeline")
+            stages.append(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    if cur:
+        stages.append(cur)
+    return stages
+
+
+def execute_pipeline(stages: List[List[str]]):
+    procs = []
+    prev_proc = None
+    for i, argv in enumerate(stages):
+        stdin = prev_proc.stdout if prev_proc is not None else None
+        stdout = subprocess.PIPE
+        try:
+            proc = subprocess.Popen(argv, stdin=stdin, stdout=stdout, stderr=subprocess.PIPE, text=True)
+        except FileNotFoundError as e:
+            for p in procs:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            raise e
+        if prev_proc is not None:
+            prev_proc.stdout.close()
+        procs.append(proc)
+        prev_proc = proc
+
+    stdout, stderr = procs[-1].communicate()
+    for p in procs[:-1]:
+        p.wait()
+    return procs[-1].returncode, stdout, stderr
+
+
+def process_command_external(command_line: str, cwd: str = None):
+    # If shell operators present, fall back to shell=True
+    if is_shell_operator_present(command_line):
+        res = subprocess.run(command_line, shell=True, capture_output=True, text=True, cwd=cwd)
+        return res.returncode, res.stdout, res.stderr
+
+    # If pipelines are present, handle them natively
+    if "|" in command_line:
+        try:
+            stages = split_pipeline_stages(command_line)
+        except ValueError as e:
+            return 1, "", str(e)
+        try:
+            return execute_pipeline(stages)
+        except FileNotFoundError as e:
+            return 127, "", f"Command not found in pipeline: {e}"
+        except Exception as e:
+            return 1, "", str(e)
+
+    # Safe argv execution
+    argv = shlex.split(command_line, posix=True)
+    if not argv:
+        return 0, "", ""
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, cwd=cwd)
+        return res.returncode, res.stdout, res.stderr
+    except FileNotFoundError:
+        return 127, "", f"Command not found: {argv[0]}"
+    except Exception as e:
+        return 1, "", str(e)
+
+
+# --- Mixed pipeline executor that supports builtin producers like `dir` ---
+
+def execute_mixed_pipeline(stages: List[List[str]], app: PyShell, cwd: Optional[str] = None):
+    """
+    Execute a pipeline where some stages may be builtins (present in app.builtins).
+    Builtin stages must accept (args, out=None) and write their output to the provided file-like `out`.
+    External stages are launched with subprocess.Popen.
+
+    Returns: (returncode, stdout, stderr)
+    """
+    procs = []
+    threads = []
+    prev_read_fd = None      # integer FD when the producer was a builtin
+    prev_proc = None         # subprocess.Popen when the producer was an external process
+
+    try:
+        for i, argv in enumerate(stages):
+            is_builtin = argv[0] in app.builtins
+            next_is_last = (i == len(stages) - 1)
+
+            if is_builtin:
+                # create a pipe: builtin writes to w_fd, we read from r_fd
+                r_fd, w_fd = os.pipe()
+                w_file = os.fdopen(w_fd, 'w', encoding='utf-8', errors='replace', buffering=1)
+
+                def run_builtin_write(fn: Callable, args, out_file, target_cwd):
+                    orig_cwd = os.getcwd()
+                    try:
+                        if target_cwd:
+                            os.chdir(target_cwd)
+                        fn(args, out=out_file)
+                    except Exception as e:
+                        try:
+                            out_file.write(f"Builtin error: {e}\n")
+                        except Exception:
+                            pass
+                    finally:
+                        try:
+                            out_file.close()
+                        except Exception:
+                            pass
+                        try:
+                            if target_cwd:
+                                os.chdir(orig_cwd)
+                        except Exception:
+                            pass
+
+                t = threading.Thread(target=run_builtin_write, args=(app.builtins[argv[0]], argv[1:], w_file, cwd))
+                t.daemon = True
+                t.start()
+                threads.append(t)
+
+                # builtin produced a read fd for the next stage
+                # if there was a previous external process, its stdout should already have been consumed
+                if prev_proc is not None:
+                    # previous external's stdout should be closed by now (no longer used)
+                    try:
+                        prev_proc.stdout.close()
+                    except Exception:
+                        pass
+                    prev_proc = None
+                # close any old prev_read_fd (shouldn't normally be set)
+                if prev_read_fd is not None:
+                    try:
+                        os.close(prev_read_fd)
+                    except Exception:
+                        pass
+                prev_read_fd = r_fd
+
+            else:
+                # External command
+                stdin_param = None
+                # If previous stage was an external process, connect its stdout directly
+                if prev_proc is not None:
+                    stdin_param = prev_proc.stdout
+                # Else if previous stage was builtin, use its read fd as file object
+                elif prev_read_fd is not None:
+                    stdin_param = os.fdopen(prev_read_fd, 'r', encoding='utf-8', errors='replace')
+
+                try:
+                    proc = subprocess.Popen(argv,
+                                            stdin=stdin_param,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE,
+                                            text=True,
+                                            cwd=cwd)
+                except FileNotFoundError as e:
+                    # cleanup
+                    for p in procs:
+                        try:
+                            p.kill()
+                        except Exception:
+                            pass
+                    for t in threads:
+                        t.join(timeout=0.1)
+                    raise e
+
+                procs.append(proc)
+
+                # If we created a file object for prev_read_fd, close it in parent (proc has its own fd)
+                if prev_read_fd is not None:
+                    try:
+                        stdin_param.close()
+                    except Exception:
+                        pass
+                # If prev_proc was an external Popen, close prev_proc.stdout in parent so the child sees EOF when appropriate
+                if prev_proc is not None:
+                    try:
+                        prev_proc.stdout.close()
+                    except Exception:
+                        pass
+
+                # now the current external becomes the prev_proc for the next stage
+                prev_proc = proc
+                prev_read_fd = None
+
+        # After launching all stages, obtain final output
+        if procs:
+            last_proc = procs[-1]
+            stdout, stderr = last_proc.communicate()
+            for p in procs[:-1]:
+                try:
+                    p.wait()
+                except Exception:
+                    pass
+            for t in threads:
+                t.join(timeout=0.1)
+            return last_proc.returncode, stdout, stderr
+        else:
+            # pipeline consisted only of builtins — read from the last builtin pipe (prev_read_fd)
+            if prev_read_fd is None:
+                return 0, "", ""
+            try:
+                with os.fdopen(prev_read_fd, 'r', encoding='utf-8', errors='replace') as rf:
+                    content = rf.read()
+            except Exception as e:
+                content = f"Error reading builtin output: {e}\n"
+            for t in threads:
+                t.join(timeout=0.1)
+            return 0, content, ""
+    except FileNotFoundError as e:
+        return 127, "", f"Command not found in pipeline: {e}"
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def handle_echo(self, args, out=None):
+    """Echo that writes to out (file-like) if provided, otherwise to GUI."""
+    text = " ".join(args) + "\n" if args else "\n"
+    if out:
+        out.write(text)
+        out.flush()
+    else:
+        self.print_to_output(text)
+
+
+def handle_pwd(self, args, out=None):
+    text = os.getcwd() + "\n"
+    if out:
+        out.write(text); out.flush()
+    else:
+        self.print_to_output(text)
+
+
+def handle_history(self, args, out=None):
+    out_lines = "\n".join(f"{i+1}  {h}" for i, h in enumerate(self.command_history)) + "\n"
+    if out:
+        out.write(out_lines); out.flush()
+    else:
+        self.print_to_output(out_lines)
+
+
+def handle_dir(self, args, out=None):
+    """
+    Pipeline-capable dir:
+    - if out is provided: write entries into out (text)
+    - otherwise print to GUI (similar to previous handle_dir)
+    """
+    try:
+        target = self.current_cwd if not args else args[0]
+        target = os.path.expanduser(target)
+        if not os.path.exists(target):
+            msg = f"dir: cannot access '{target}': No such file or directory\n"
+            if out:
+                out.write(msg); out.flush()
+            else:
+                self.print_to_output(msg)
+            return
+
+        header = f"\n Directory of {target}\n\n"
+        if out:
+            out.write(header)
+        else:
+            self.print_to_output(header)
+
+        for entry in sorted(os.listdir(target), key=str.lower):
+            full_path = os.path.join(target, entry)
+            if os.path.isdir(full_path):
+                tag = "<DIR>"
+                line = f" {tag:10} {entry}\n"
+            else:
+                size = os.path.getsize(full_path)
+                line = f" {size:10} {entry}\n"
+            if out:
+                out.write(line)
+            else:
+                self.print_to_output(line)
+
+        if out:
+            out.write("\n"); out.flush()
+        else:
+            self.print_to_output("\n")
+
+    except Exception as e:
+        msg = f"dir error: {e}\n"
+        if out:
+            out.write(msg); out.flush()
+        else:
+            self.print_to_output(msg)
+
+
+# If run directly, act as a GUI application
 if __name__ == "__main__":
-    app = PyShell()
-    app.mainloop()
+    import traceback, time
+
+    LOG_PATH = os.path.join(os.getcwd(), "aura_error_log.txt")
+
+    def log_and_print(msg: str):
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {msg}\n")
+        except Exception:
+            pass
+        try:
+            print(msg)
+        except Exception:
+            pass
+
+    try:
+        # Quick dependency sanity checks
+        missing = []
+        try:
+            import tkinter  # noqa: F401
+        except Exception:
+            missing.append("tkinter")
+        try:
+            import rapidfuzz  # noqa: F401
+        except Exception:
+            missing.append("rapidfuzz (pip install rapidfuzz)")
+
+        if missing:
+            log_and_print("Missing dependencies detected: " + ", ".join(missing))
+            log_and_print("Attempting to continue, but install missing packages and restart for full GUI.")
+            # If tkinter missing, fall back to a simple console message
+            if "tkinter" in missing:
+                print("tkinter not available. Exiting GUI. See aura_error_log.txt for details.")
+                raise SystemExit(1)
+
+        # Normal GUI start
+        try:
+            app = PyShell()
+            app.mainloop()
+        except Exception as gui_exc:
+            tb = traceback.format_exc()
+            log_and_print("Unhandled exception in GUI startup:\n" + tb)
+            # Try a minimal fallback that at least prints an error and drops to REPL-like prompt
+            print("GUI failed to start. Logged traceback to aura_error_log.txt.")
+            print("Starting minimal console fallback for diagnosis. Type 'exit' to quit.")
+            while True:
+                try:
+                    line = input("aurashell-cmd> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print('\\nExiting fallback.')
+                    break
+                if not line:
+                    continue
+                if line.lower() in ("exit", "quit"):
+                    break
+                # Simple exec: print what's parsed (do not execute dangerous shell)
+                print("You entered:", line)
+            raise SystemExit(1)
+
+    except SystemExit:
+        # allow normal exit
+        raise
+    except Exception as e:
+        # catastrophic, log the exception
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write("CRITICAL STARTUP ERROR:\n")
+                traceback.print_exc(file=f)
+        except Exception:
+            pass
+        print("Critical error during startup. See aura_error_log.txt for details.")
+        raise
